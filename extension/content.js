@@ -1,24 +1,36 @@
 /**
- * content.js — Auto-scanning LARP Radar for LinkedIn
+ * content.js
  *
- * Instead of a manual "Detect LARP" button, this version:
- * 1. IntersectionObserver: detects posts entering the viewport → injects a pending badge
- * 2. MutationObserver (per-post): fires when the user clicks "see more" → full text available → auto-analyzes
- * 3. Short posts (no "see more"): analyzed immediately on viewport entry
- *
- * Forked from: abdullah-mansoor3/linkedin-larp-detector
+ * Auto-scans LinkedIn posts as they enter the viewport.
+ * - Injects a small "🎭 analyzing..." badge
+ * - Analyzes short posts immediately
+ * - Waits for expanded text on long "see more" posts
+ * - Sends text to background.js via chrome.runtime.sendMessage
+ * - Updates badge with score + label
  */
 
-const PROCESSED_ATTR = "data-larp-scanned";
-const ANALYZED_ATTR  = "data-larp-done";
+const POST_PROCESSED_ATTR = "data-larp-processed";
+const POST_ANALYZING_ATTR = "data-larp-analyzing";
+const POST_ANALYZED_ATTR = "data-larp-analyzed";
+const BADGE_CLASS = "larp-detector-pill";
+const CARD_CLASS = "larp-detector-card";
 
 const SCORE_COLORS = {
-  genuine:  { bg: "#e6f9f0", border: "#34d399", text: "#065f46" },
-  mild:     { bg: "#fefce8", border: "#facc15", text: "#713f12" },
+  genuine: { bg: "#ecfdf5", border: "#34d399", text: "#065f46" },
+  mild: { bg: "#fefce8", border: "#facc15", text: "#713f12" },
   moderate: { bg: "#fff7ed", border: "#fb923c", text: "#7c2d12" },
-  high:     { bg: "#fef2f2", border: "#f87171", text: "#7f1d1d" },
-  peak:     { bg: "#1a0505",  border: "#dc2626", text: "#fca5a5" },
+  high: { bg: "#fef2f2", border: "#f87171", text: "#7f1d1d" },
+  peak: { bg: "#1f0909", border: "#dc2626", text: "#fecaca" },
+  pending: { bg: "#f8fafc", border: "#cbd5e1", text: "#475569" },
+  error: { bg: "#fef2f2", border: "#ef4444", text: "#b91c1c" },
+  warning: { bg: "#fffbeb", border: "#f59e0b", text: "#92400e" },
 };
+
+const POST_SELECTORS = [
+  ".feed-shared-update-v2",
+  ".occludable-update",
+  "[data-urn]"
+];
 
 function getScoreTier(score) {
   if (score <= 20) return "genuine";
@@ -28,15 +40,165 @@ function getScoreTier(score) {
   return "peak";
 }
 
-function getScoreLabel(score) {
-  if (score <= 20) return "✅ Genuine";
-  if (score <= 40) return "🟡 Mild LARP";
-  if (score <= 60) return "🟠 Moderate LARP";
-  if (score <= 80) return "🔴 High LARP";
-  return "💀 Peak LARP";
+function getDisplayLabel(score, label) {
+  if (label && typeof label === "string" && label.trim()) return label.trim();
+  if (score <= 20) return "Genuine";
+  if (score <= 40) return "Mild LARP";
+  if (score <= 60) return "Moderate LARP";
+  if (score <= 80) return "High LARP";
+  return "Peak LARP";
 }
 
-// ─── Text extraction (unchanged from original) ────────────────────────────────
+function applyBadgeStyle(badge, palette) {
+  badge.style.background = palette.bg;
+  badge.style.borderColor = palette.border;
+  badge.style.color = palette.text;
+}
+
+function createBadge() {
+  const badge = document.createElement("button");
+  badge.type = "button";
+  badge.className = BADGE_CLASS;
+  badge.textContent = "🎭 analyzing...";
+  badge.style.cssText = `
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid ${SCORE_COLORS.pending.border};
+    background: ${SCORE_COLORS.pending.bg};
+    color: ${SCORE_COLORS.pending.text};
+    font-size: 12px;
+    font-weight: 600;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.2;
+    cursor: default;
+    user-select: none;
+    appearance: none;
+    box-shadow: none;
+  `;
+  badge.disabled = true;
+  badge.title = "Analyzing this post";
+  return badge;
+}
+
+function setBadgePending(badge, message = "🎭 analyzing...") {
+  badge.textContent = message;
+  badge.disabled = true;
+  badge.style.cursor = "default";
+  applyBadgeStyle(badge, SCORE_COLORS.pending);
+}
+
+function setBadgeError(badge, message = "🎭 error analyzing") {
+  badge.textContent = message;
+  badge.disabled = false;
+  badge.style.cursor = "pointer";
+  applyBadgeStyle(badge, SCORE_COLORS.error);
+  badge.title = "Click to retry";
+}
+
+function setBadgeRateLimited(badge) {
+  badge.textContent = "⏳ rate limited";
+  badge.disabled = false;
+  badge.style.cursor = "pointer";
+  applyBadgeStyle(badge, SCORE_COLORS.warning);
+  badge.title = "Click to retry";
+}
+
+function setBadgeResult(badge, result) {
+  const score = Number(result?.score ?? 0);
+  const label = getDisplayLabel(score, result?.label);
+  const tier = getScoreTier(score);
+  applyBadgeStyle(badge, SCORE_COLORS[tier]);
+  badge.textContent = `🎭 ${score}% LARP — ${label}`;
+  badge.disabled = false;
+  badge.style.cursor = "pointer";
+  badge.title = "Click to view analysis";
+}
+
+function removeExistingCard(postEl) {
+  const existing = postEl.querySelector(`.${CARD_CLASS}`);
+  if (existing) existing.remove();
+}
+
+function renderResultCard(postEl, result) {
+  removeExistingCard(postEl);
+
+  const score = Number(result?.score ?? 0);
+  const label = getDisplayLabel(score, result?.label);
+  const reason = result?.reason || "No explanation returned.";
+  const translation = result?.translation || null;
+  const tier = getScoreTier(score);
+  const colors = SCORE_COLORS[tier];
+
+  const card = document.createElement("div");
+  card.className = CARD_CLASS;
+  card.style.cssText = `
+    margin-top: 10px;
+    padding: 14px 16px;
+    border-radius: 12px;
+    border: 1.5px solid ${colors.border};
+    background: ${colors.bg};
+    color: ${colors.text};
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  `;
+
+  card.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px;">
+      <div style="font-weight:700;font-size:15px;">🎭 ${score}% LARP — ${escapeHtml(label)}</div>
+      <button
+        type="button"
+        class="larp-close"
+        style="
+          border:none;
+          background:transparent;
+          color:inherit;
+          cursor:pointer;
+          font-size:18px;
+          line-height:1;
+          padding:0;
+        "
+        aria-label="Close analysis"
+      >×</button>
+    </div>
+
+    <div style="margin-bottom:8px;">
+      <div style="font-size:12px;font-weight:700;opacity:0.8;text-transform:uppercase;letter-spacing:0.04em;">Reason</div>
+      <div>${escapeHtml(reason)}</div>
+    </div>
+
+    ${
+      translation
+        ? `
+      <div>
+        <div style="font-size:12px;font-weight:700;opacity:0.8;text-transform:uppercase;letter-spacing:0.04em;">What they actually mean</div>
+        <div>${escapeHtml(translation)}</div>
+      </div>
+    `
+        : ""
+    }
+  `;
+
+  const closeBtn = card.querySelector(".larp-close");
+  if (closeBtn) {
+    closeBtn.addEventListener("click", () => card.remove());
+  }
+
+  postEl.appendChild(card);
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
 
 function extractPostText(postEl) {
   const selectors = [
@@ -46,276 +208,206 @@ function extractPostText(postEl) {
     "[data-test-id='main-feed-activity-card__commentary']",
     ".attributed-text-segment-list__content",
   ];
-  for (const sel of selectors) {
-    const el = postEl.querySelector(sel);
-    if (el && el.innerText.trim()) return el.innerText.trim();
+
+  for (const selector of selectors) {
+    const el = postEl.querySelector(selector);
+    const text = el?.innerText?.trim();
+    if (text && text.length > 20) return normalizeWhitespace(text);
   }
-  const blocks = Array.from(postEl.querySelectorAll("p, span"));
-  return blocks
-    .map((b) => b.innerText.trim())
-    .filter((t) => t.length > 20)
-    .join("\n")
-    .trim();
+
+  const fallbackBlocks = Array.from(postEl.querySelectorAll("p, span, div"))
+    .map((el) => el.innerText?.trim() || "")
+    .filter((text) => text.length > 30);
+
+  const joined = fallbackBlocks.join("\n").trim();
+  return normalizeWhitespace(joined);
 }
 
-// ─── "See more" detection ─────────────────────────────────────────────────────
+function normalizeWhitespace(text) {
+  return text.replace(/\n{3,}/g, "\n\n").replace(/[ \t]{2,}/g, " ").trim();
+}
 
 function findSeeMoreButton(postEl) {
+  const directMatches = [
+    ".feed-shared-inline-show-more-text__see-more-less-toggle",
+    "button.feed-shared-text-view__see-more",
+    "button[aria-label*='see more' i]",
+  ];
+
+  for (const selector of directMatches) {
+    const el = postEl.querySelector(selector);
+    if (el) return el;
+  }
+
+  return Array.from(postEl.querySelectorAll("button, span[role='button'], div[role='button']"))
+    .find((el) => /see more/i.test(el.textContent || "")) || null;
+}
+
+function isElementVisible(el) {
+  return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+}
+
+function getBadgeAnchor(postEl) {
   return (
-    postEl.querySelector(".feed-shared-inline-show-more-text__see-more-less-toggle") ||
-    postEl.querySelector("button.feed-shared-text-view__see-more") ||
-    postEl.querySelector("button[aria-label*='see more']") ||
-    postEl.querySelector("span.see-more") ||
-    // generic fallback — any button with "see more" text
-    Array.from(postEl.querySelectorAll("button, span[role='button']")).find(
-      (el) => /see more/i.test(el.textContent)
-    ) || null
+    postEl.querySelector(".feed-shared-social-action-bar") ||
+    postEl.querySelector(".social-actions-bar") ||
+    postEl.querySelector(".feed-shared-update-v2__description-wrapper") ||
+    postEl
   );
 }
 
-// ─── Badge (the inline pill that shows larp status) ──────────────────────────
+function ensureBadge(postEl) {
+  let badge = postEl.querySelector(`.${BADGE_CLASS}`);
+  if (badge) return badge;
 
-function createBadge() {
-  const badge = document.createElement("span");
-  badge.className = "larp-pill";
-  badge.style.cssText = `
-    display: inline-flex; align-items: center;
-    margin-left: 10px; padding: 2px 10px;
-    border-radius: 999px; border: 1.5px solid #94a3b8;
-    background: #f8fafc; color: #64748b;
-    font-size: 12px; font-weight: 600;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    cursor: default; user-select: none;
-    transition: all 0.2s ease;
-    vertical-align: middle;
-  `;
-  badge.textContent = "🎭 pending";
+  badge = createBadge();
+  const anchor = getBadgeAnchor(postEl);
+  anchor.appendChild(badge);
   return badge;
 }
 
-function updateBadgeLoading(badge) {
-  badge.textContent = "🎭 scanning…";
-  badge.style.borderColor = "#94a3b8";
-  badge.style.color = "#64748b";
-  badge.style.background = "#f1f5f9";
-}
-
-function updateBadgeResult(badge, data, postEl) {
-  const tier   = getScoreTier(data.score);
-  const colors = SCORE_COLORS[tier];
-  const label  = getScoreLabel(data.score);
-
-  badge.textContent = `${label} · ${data.score} · ${data.category}`;
-  badge.style.borderColor = colors.border;
-  badge.style.color       = colors.text;
-  badge.style.background  = colors.bg;
-  badge.style.cursor      = "pointer";
-  badge.title             = "Click to see full breakdown";
-
-  badge.onclick = () => renderResultCard(postEl, data, badge);
-}
-
-function updateBadgeError(badge) {
-  badge.textContent    = "🎭 error";
-  badge.style.color    = "#ef4444";
-  badge.style.border   = "1.5px solid #ef4444";
-  badge.style.background = "#fef2f2";
-}
-
-function updateBadgeRateLimit(badge) {
-  badge.textContent  = "⏳ rate limited";
-  badge.style.color  = "#f59e0b";
-  badge.style.border = "1.5px solid #f59e0b";
-  badge.style.background = "#fffbeb";
-}
-
-// ─── Result card (unchanged look, triggered on badge click) ──────────────────
-
-function renderResultCard(postEl, data, badge) {
-  // toggle off if already showing
-  const existing = postEl.querySelector(".larp-result-card");
-  if (existing) { existing.remove(); return; }
-
-  const tier   = getScoreTier(data.score);
-  const colors = SCORE_COLORS[tier];
-  const label  = getScoreLabel(data.score);
-
-  const card = document.createElement("div");
-  card.className = "larp-result-card";
-  card.style.cssText = `
-    margin: 12px 0;
-    padding: 16px;
-    border-radius: 12px;
-    border: 2px solid ${colors.border};
-    background: ${colors.bg};
-    color: ${colors.text};
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-size: 14px;
-    line-height: 1.5;
-    animation: larpFadeIn 0.3s ease;
-  `;
-
-  card.innerHTML = `
-    <style>
-      @keyframes larpFadeIn {
-        from { opacity: 0; transform: translateY(-6px); }
-        to   { opacity: 1; transform: translateY(0); }
-      }
-      .larp-score-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-      .larp-badge-inner {
-        font-weight: 700; font-size: 13px; padding: 3px 10px;
-        border-radius: 999px; background: ${colors.border};
-        color: #fff; white-space: nowrap;
-      }
-      .larp-score-num { font-size: 22px; font-weight: 800; }
-      .larp-category-label { font-size: 12px; opacity: 0.8; font-style: italic; }
-      .larp-section-title {
-        font-weight: 700; font-size: 12px; text-transform: uppercase;
-        letter-spacing: 0.05em; margin: 10px 0 4px; opacity: 0.7;
-      }
-      .larp-reason { margin-bottom: 8px; }
-      .larp-translation {
-        background: rgba(0,0,0,0.06); border-radius: 8px;
-        padding: 10px 12px; font-style: italic;
-      }
-      .larp-cached-note {
-        font-size: 11px; opacity: 0.5; margin-top: 8px; text-align: right;
-      }
-      .larp-close {
-        float: right; cursor: pointer; font-size: 18px;
-        line-height: 1; opacity: 0.5; border: none; background: none;
-        color: inherit; padding: 0; margin-left: 8px;
-      }
-      .larp-close:hover { opacity: 1; }
-    </style>
-    <div class="larp-score-row">
-      <span class="larp-score-num">${data.score}</span>
-      <div>
-        <div><span class="larp-badge-inner">${label}</span></div>
-        <div class="larp-category-label">${data.category}</div>
-      </div>
-      <button class="larp-close" title="Dismiss">✕</button>
-    </div>
-    <div class="larp-section-title">Why</div>
-    <div class="larp-reason">${data.reason}</div>
-    <div class="larp-section-title">What they actually mean</div>
-    <div class="larp-translation">${data.translation}</div>
-    ${data.cached ? '<div class="larp-cached-note">⚡ Cached result</div>' : ""}
-  `;
-
-  card.querySelector(".larp-close").addEventListener("click", () => card.remove());
-  postEl.appendChild(card);
-}
-
-// ─── Core: analyze a post ────────────────────────────────────────────────────
-
 async function analyzePost(postEl, badge) {
-  if (postEl.hasAttribute(ANALYZED_ATTR)) return;
-  postEl.setAttribute(ANALYZED_ATTR, "true");
-
-  const text = extractPostText(postEl);
-  if (!text || text.length < 30) {
-    // not enough text — reset so it can retry later
-    postEl.removeAttribute(ANALYZED_ATTR);
+  if (postEl.hasAttribute(POST_ANALYZING_ATTR) || postEl.hasAttribute(POST_ANALYZED_ATTR)) {
     return;
   }
 
-  updateBadgeLoading(badge);
+  const text = extractPostText(postEl);
+  if (!text || text.length < 30) return;
+
+  postEl.setAttribute(POST_ANALYZING_ATTR, "true");
+  setBadgePending(badge, "🎭 analyzing...");
 
   try {
-    const result = await chrome.runtime.sendMessage({ type: "ANALYZE_POST", text });
+    const result = await chrome.runtime.sendMessage({
+      type: "ANALYZE_POST",
+      text,
+    });
 
-    if (result?.error) {
-      if (/rate/i.test(result.error)) updateBadgeRateLimit(badge);
-      else updateBadgeError(badge);
-      postEl.removeAttribute(ANALYZED_ATTR);
+    postEl.removeAttribute(POST_ANALYZING_ATTR);
+
+    if (!result) {
+      setBadgeError(badge, "🎭 no response");
+      badge.onclick = () => analyzePost(postEl, badge);
       return;
     }
 
-    updateBadgeResult(badge, result, postEl);
+    if (result.error) {
+      if (/rate/i.test(result.error)) {
+        setBadgeRateLimited(badge);
+      } else {
+        setBadgeError(badge, "🎭 analysis failed");
+      }
+      badge.onclick = () => analyzePost(postEl, badge);
+      return;
+    }
 
-  } catch (err) {
-    updateBadgeError(badge);
-    postEl.removeAttribute(ANALYZED_ATTR);
+    postEl.setAttribute(POST_ANALYZED_ATTR, "true");
+    setBadgeResult(badge, result);
+
+    badge.onclick = () => {
+      const existing = postEl.querySelector(`.${CARD_CLASS}`);
+      if (existing) {
+        existing.remove();
+      } else {
+        renderResultCard(postEl, result);
+      }
+    };
+  } catch (error) {
+    postEl.removeAttribute(POST_ANALYZING_ATTR);
+    setBadgeError(badge, "🎭 analysis failed");
+    badge.onclick = () => analyzePost(postEl, badge);
   }
 }
 
-// ─── Per-post setup ───────────────────────────────────────────────────────────
-
-function setupPost(postEl) {
-  if (postEl.hasAttribute(PROCESSED_ATTR)) return;
-  postEl.setAttribute(PROCESSED_ATTR, "true");
-
-  // Inject badge into the action bar (like/comment row)
-  const actionBar =
-    postEl.querySelector(".feed-shared-social-action-bar") ||
-    postEl.querySelector(".social-actions-bar") ||
-    postEl;
-
-  const badge = createBadge();
-  actionBar.appendChild(badge);
-
-  const seeMoreBtn = findSeeMoreButton(postEl);
-
-  if (!seeMoreBtn) {
-    // Short post — analyze immediately
-    analyzePost(postEl, badge);
-    return;
-  }
-
-  // Long post — wait for "see more" click so we get the full text
-  badge.title = "Will auto-analyze when you expand the post";
-
-  // MutationObserver watches the post DOM for when the see-more button disappears
-  // (LinkedIn removes or hides it once the text is expanded)
-  const seeMoreObserver = new MutationObserver(() => {
-    const stillHidden = findSeeMoreButton(postEl);
-    if (!stillHidden || stillHidden.offsetParent === null) {
-      // Button gone or hidden → text is now fully expanded
-      seeMoreObserver.disconnect();
+function watchExpandedPost(postEl, badge) {
+  const observer = new MutationObserver(() => {
+    const btn = findSeeMoreButton(postEl);
+    if (!btn || !isElementVisible(btn)) {
+      observer.disconnect();
+      setBadgePending(badge, "🎭 analyzing...");
       analyzePost(postEl, badge);
     }
   });
 
-  seeMoreObserver.observe(postEl, { childList: true, subtree: true, attributes: true });
+  observer.observe(postEl, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    characterData: true,
+  });
+
+  // fallback: let user manually click later and we still keep the observer alive
+  setBadgePending(badge, "🎭 expand post to analyze");
 }
 
-// ─── IntersectionObserver: lazy-init posts as they enter the viewport ─────────
+function setupPost(postEl) {
+  if (!(postEl instanceof HTMLElement)) return;
+  if (postEl.hasAttribute(POST_PROCESSED_ATTR)) return;
+
+  postEl.setAttribute(POST_PROCESSED_ATTR, "true");
+  const badge = ensureBadge(postEl);
+
+  const seeMoreBtn = findSeeMoreButton(postEl);
+  if (seeMoreBtn && isElementVisible(seeMoreBtn)) {
+    watchExpandedPost(postEl, badge);
+  } else {
+    analyzePost(postEl, badge);
+  }
+}
 
 const viewportObserver = new IntersectionObserver(
   (entries) => {
-    entries.forEach((entry) => {
-      if (entry.isIntersecting) {
-        setupPost(entry.target);
-        // Only need to set it up once
-        viewportObserver.unobserve(entry.target);
-      }
-    });
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      setupPost(entry.target);
+      viewportObserver.unobserve(entry.target);
+    }
   },
-  { rootMargin: "0px 0px 200px 0px" } // 200px lookahead below fold
+  {
+    root: null,
+    rootMargin: "0px 0px 250px 0px",
+    threshold: 0.05,
+  }
 );
 
-// ─── DOM scanner ─────────────────────────────────────────────────────────────
+function looksLikeRealPost(el) {
+  if (!(el instanceof HTMLElement)) return false;
+  const text = el.innerText?.trim() || "";
+  if (text.length < 40) return false;
 
-const POST_SELECTORS = [
-  ".feed-shared-update-v2",
-  ".occludable-update",
-  "[data-urn]",
-];
+  const hasLinkedInPostMarkers =
+    el.querySelector(".feed-shared-social-action-bar") ||
+    el.querySelector(".feed-shared-update-v2__description") ||
+    el.querySelector(".update-components-text") ||
+    el.querySelector("[aria-label*='Like' i]");
 
-function scanForPosts() {
-  POST_SELECTORS.forEach((sel) => {
-    document.querySelectorAll(sel).forEach((el) => {
-      if (!el.hasAttribute(PROCESSED_ATTR)) {
-        viewportObserver.observe(el);
-      }
-    });
-  });
+  return !!hasLinkedInPostMarkers;
 }
 
-// Initial scan
-scanForPosts();
+function scanForPosts() {
+  for (const selector of POST_SELECTORS) {
+    const nodes = document.querySelectorAll(selector);
+    nodes.forEach((node) => {
+      if (!looksLikeRealPost(node)) return;
+      if (node.hasAttribute(POST_PROCESSED_ATTR)) return;
+      viewportObserver.observe(node);
+    });
+  }
+}
 
-// Watch for new posts injected by LinkedIn's SPA
-const domObserver = new MutationObserver(scanForPosts);
-domObserver.observe(document.body, { childList: true, subtree: true });
+function boot() {
+  scanForPosts();
+
+  const domObserver = new MutationObserver(() => {
+    scanForPosts();
+  });
+
+  if (document.body) {
+    domObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+}
+
+boot();
